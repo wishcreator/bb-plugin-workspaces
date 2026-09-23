@@ -352,6 +352,113 @@ describe("Workspaces page", () => {
   });
 });
 
+describe("Session route picker", () => {
+  beforeEach(() => globalThis.localStorage.clear());
+
+  const billingWorkspace = {
+    ...workspace,
+    id: "ws_billing",
+    name: "Billing",
+    repositories: [{ projectId: "proj_gateway", alias: "gateway", ordinal: 0 }],
+  };
+
+  it("forwards an explicit provider and model pair to session_start", async () => {
+    const app = await loadPluginApp(() => import("../app"));
+    const launches: Array<Record<string, unknown>> = [];
+    const slot = renderSlot(app.navPanels[0]!, { subPath: "" }, { rpc: {
+      dashboard: () => ({ workspaces: [workspace], sessions: [], projects: [project, gatewayProject] }),
+      session_start: (input: unknown) => { launches.push(input as Record<string, unknown>); return activeSession; },
+    } });
+
+    expect(await slot.findByText("Route: project default")).toBeTruthy();
+    fireEvent.change(slot.getByLabelText("Agent route"), { target: { value: "explicit" } });
+    fireEvent.change(slot.getByLabelText("Provider ID"), { target: { value: "acp-oxi-devin-pool" } });
+    fireEvent.change(slot.getByLabelText("Model ID"), { target: { value: "acp-default" } });
+    expect(slot.getByText("Route: acp-oxi-devin-pool · acp-default")).toBeTruthy();
+    fireEvent.change(slot.getByLabelText("Task prompt"), { target: { value: "Rotate the signing keys" } });
+    fireEvent.click(slot.getByRole("button", { name: "Start thread" }));
+
+    await expect.poll(() => launches).toHaveLength(1);
+    expect(launches[0]).toMatchObject({ providerId: "acp-oxi-devin-pool", model: "acp-default" });
+    expect(launches[0]).not.toHaveProperty("permissionMode");
+    slot.lifecycle.unmount();
+  });
+
+  it("omits provider and model entirely for the project default route", async () => {
+    const app = await loadPluginApp(() => import("../app"));
+    const launches: Array<Record<string, unknown>> = [];
+    const slot = renderSlot(app.navPanels[0]!, { subPath: "" }, { rpc: {
+      dashboard: () => ({ workspaces: [workspace], sessions: [], projects: [project, gatewayProject] }),
+      session_start: (input: unknown) => { launches.push(input as Record<string, unknown>); return activeSession; },
+    } });
+
+    expect(await slot.findByText("Route: project default")).toBeTruthy();
+    fireEvent.change(slot.getByLabelText("Task prompt"), { target: { value: "Rotate the signing keys" } });
+    fireEvent.click(slot.getByRole("button", { name: "Start thread" }));
+
+    await expect.poll(() => launches).toHaveLength(1);
+    expect(launches[0]).not.toHaveProperty("providerId");
+    expect(launches[0]).not.toHaveProperty("model");
+    slot.lifecycle.unmount();
+  });
+
+  it.each([
+    ["Provider ID", "acp-oxi-devin-pool"],
+    ["Model ID", "acp-default"],
+  ])("cannot dispatch with only %s filled", async (label, value) => {
+    const app = await loadPluginApp(() => import("../app"));
+    const slot = renderSlot(app.navPanels[0]!, { subPath: "" }, { rpc: {
+      dashboard: () => ({ workspaces: [workspace], sessions: [], projects: [project, gatewayProject] }),
+      session_start: () => activeSession,
+    } });
+
+    fireEvent.change(await slot.findByLabelText("Agent route"), { target: { value: "explicit" } });
+    fireEvent.change(slot.getByLabelText(label), { target: { value } });
+    fireEvent.change(slot.getByLabelText("Task prompt"), { target: { value: "Rotate the signing keys" } });
+    expect(slot.getByText(/sent as a pair/)).toBeTruthy();
+    const startButton = slot.getByRole("button", { name: "Start thread" });
+    expect(startButton.hasAttribute("disabled")).toBe(true);
+    fireEvent.click(startButton);
+    fireEvent.submit(startButton.closest("form")!);
+    await act(async () => { await Promise.resolve(); });
+
+    expect(slot.inspection.rpcCalls.filter((call) => call.method === "session_start")).toHaveLength(0);
+    slot.lifecycle.unmount();
+  });
+
+  it("restores a workspace's explicit route without leaking it to another workspace", async () => {
+    const app = await loadPluginApp(() => import("../app"));
+    const launches: Array<Record<string, unknown>> = [];
+    const rpc = {
+      dashboard: () => ({ workspaces: [workspace, billingWorkspace], sessions: [], projects: [project, gatewayProject] }),
+      session_start: (input: unknown) => { launches.push(input as Record<string, unknown>); return activeSession; },
+    };
+    const first = renderSlot(app.navPanels[0]!, { subPath: "" }, { rpc });
+    fireEvent.change(await first.findByLabelText("Agent route"), { target: { value: "explicit" } });
+    fireEvent.change(first.getByLabelText("Provider ID"), { target: { value: "acp-oxi-devin-pool" } });
+    fireEvent.change(first.getByLabelText("Model ID"), { target: { value: "acp-default" } });
+    first.lifecycle.unmount();
+
+    const second = renderSlot(app.navPanels[0]!, { subPath: "" }, { rpc });
+    expect((await second.findByLabelText("Agent route") as HTMLSelectElement).value).toBe("explicit");
+    expect((second.getByLabelText("Provider ID") as HTMLInputElement).value).toBe("acp-oxi-devin-pool");
+    expect((second.getByLabelText("Model ID") as HTMLInputElement).value).toBe("acp-default");
+    expect(second.getByText("Route: acp-oxi-devin-pool · acp-default")).toBeTruthy();
+    expect(globalThis.localStorage.getItem("bb-workspaces:route:ws_billing")).toBeNull();
+
+    fireEvent.click(second.getByText("Billing"));
+    expect((await second.findByLabelText("Agent route") as HTMLSelectElement).value).toBe("project");
+    expect(second.getByText("Route: project default")).toBeTruthy();
+    expect(second.queryByLabelText("Provider ID")).toBeNull();
+    fireEvent.change(second.getByLabelText("Task prompt"), { target: { value: "Audit the invoices" } });
+    fireEvent.click(second.getByRole("button", { name: "Start thread" }));
+    await expect.poll(() => launches).toHaveLength(1);
+    expect(launches[0]).not.toHaveProperty("providerId");
+    expect(launches[0]).not.toHaveProperty("model");
+    second.lifecycle.unmount();
+  });
+});
+
 describe("Repositories panel", () => {
   it("keeps a pending request retryable when reconciliation removes its option", async () => {
     const app = await loadPluginApp(() => import("../app"));

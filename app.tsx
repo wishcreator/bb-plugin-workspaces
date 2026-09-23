@@ -174,6 +174,27 @@ function rememberedSelection(workspaceId: string, projectIds: string[]): Set<str
   return new Set(projectIds);
 }
 
+type SessionRoute = { providerId: string; model: string };
+
+function rememberedRoute(workspaceId: string): SessionRoute | null {
+  try {
+    const stored = globalThis.localStorage.getItem(`bb-workspaces:route:${workspaceId}`);
+    if (stored !== null) {
+      const parsed: unknown = JSON.parse(stored);
+      if (parsed !== null && typeof parsed === "object") {
+        const candidate = parsed as Record<string, unknown>;
+        if (typeof candidate.providerId === "string" && candidate.providerId.trim()
+          && typeof candidate.model === "string" && candidate.model.trim()) {
+          return { providerId: candidate.providerId.trim(), model: candidate.model.trim() };
+        }
+      }
+    }
+  } catch {
+    // Storage can be unavailable in privacy-restricted browser contexts.
+  }
+  return null;
+}
+
 function SessionLauncher({ workspace, projects, rpc, onError }: { workspace: Workspace; projects: Project[]; rpc: ReturnType<typeof useRpc<typeof rpcContract>>; onError: (message: string) => void }) {
   const navigate = useBbNavigate();
   const memberProjects = workspace.repositories.map((member) => projects.find((project) => project.id === member.projectId)).filter((project): project is Project => Boolean(project));
@@ -182,6 +203,13 @@ function SessionLauncher({ workspace, projects, rpc, onError }: { workspace: Wor
   const [prompt, setPrompt] = useState("");
   const [pending, setPending] = useState(false);
   const [requestKey, setRequestKey] = useState(() => `launch-${Date.now()}-${Math.random().toString(36).slice(2)}`);
+  const savedRoute = useMemo(() => rememberedRoute(workspace.id), [workspace.id]);
+  const [customRoute, setCustomRoute] = useState(savedRoute !== null);
+  const [providerId, setProviderId] = useState(savedRoute?.providerId ?? "");
+  const [model, setModel] = useState(savedRoute?.model ?? "");
+  const trimmedProviderId = providerId.trim();
+  const trimmedModel = model.trim();
+  const routeComplete = !customRoute || (trimmedProviderId.length > 0 && trimmedModel.length > 0);
   const eligibleHosts = useMemo(() => {
     const chosen = memberProjects.filter((project) => selected.has(project.id));
     if (chosen.length === 0) return [];
@@ -192,6 +220,16 @@ function SessionLauncher({ workspace, projects, rpc, onError }: { workspace: Wor
     try { globalThis.localStorage.setItem(`bb-workspaces:selection:${workspace.id}`, JSON.stringify([...selected])); }
     catch { /* Keep the in-memory selection when storage is unavailable. */ }
   }, [selected, workspace.id]);
+  useEffect(() => {
+    try {
+      const key = `bb-workspaces:route:${workspace.id}`;
+      if (customRoute && trimmedProviderId && trimmedModel) {
+        globalThis.localStorage.setItem(key, JSON.stringify({ providerId: trimmedProviderId, model: trimmedModel }));
+      } else {
+        globalThis.localStorage.removeItem(key);
+      }
+    } catch { /* Keep the in-memory route when storage is unavailable. */ }
+  }, [customRoute, trimmedProviderId, trimmedModel, workspace.id]);
   useEffect(() => { if (!eligibleHosts.includes(hostId)) setHostId(eligibleHosts[0] ?? ""); }, [eligibleHosts, hostId]);
   const selectedIds = useMemo(() => memberProjects.filter((project) => selected.has(project.id)).map((project) => project.id), [memberProjects, selected]);
   const { bases, error: basesError } = useRepositoryBases(rpc, hostId, selectedIds);
@@ -202,13 +240,14 @@ function SessionLauncher({ workspace, projects, rpc, onError }: { workspace: Wor
   const allDefault = selectedIds.every((projectId) => baseFor(projectId) === DEFAULT_BASE_REF);
   const start = async (event: FormEvent) => {
     event.preventDefault();
-    if (!prompt.trim() || !eligibleHosts.includes(hostId) || pending) return;
+    if (!prompt.trim() || !eligibleHosts.includes(hostId) || pending || !routeComplete) return;
     setPending(true); onError("");
     try {
       const overrides = Object.fromEntries(selectedIds.map((projectId) => [projectId, baseFor(projectId)]));
       const session = await rpc.call("session_start", {
         workspaceId: workspace.id, expectedRevision: workspace.revision, hostId,
         projectIds: [...selected], prompt: prompt.trim(), requestKey, bases: overrides,
+        ...(customRoute ? { providerId: trimmedProviderId, model: trimmedModel } : {}),
         ...(name.trim() ? { name: name.trim() } : {}),
       });
       if (session.threadId) { setRequestKey(`launch-${Date.now()}-${Math.random().toString(36).slice(2)}`); navigate.toThread(session.threadId); }
@@ -239,9 +278,23 @@ function SessionLauncher({ workspace, projects, rpc, onError }: { workspace: Wor
         </div>;
       })}</div> : null}
     </div> : null}
+    <div className="rounded-md border border-border p-2">
+      <label className="block text-sm" htmlFor={`route-${workspace.id}`}>Agent route
+        <select id={`route-${workspace.id}`} className={`${fieldClass} mt-1`} value={customRoute ? "explicit" : "project"} onChange={(event) => setCustomRoute(event.target.value === "explicit")}>
+          <option value="project">Project default</option>
+          <option value="explicit">Custom provider and model</option>
+        </select>
+      </label>
+      {customRoute ? <div className="mt-2 flex flex-wrap gap-2">
+        <label className="min-w-48 flex-1 text-sm">Provider ID<Input aria-label="Provider ID" className="mt-1" value={providerId} onChange={(event) => setProviderId(event.target.value)} placeholder="Provider id" /></label>
+        <label className="min-w-48 flex-1 text-sm">Model ID<Input aria-label="Model ID" className="mt-1" value={model} onChange={(event) => setModel(event.target.value)} placeholder="Model id" /></label>
+      </div> : null}
+      <p className="mt-2 text-xs text-muted-foreground">{customRoute ? `Route: ${trimmedProviderId || "—"} · ${trimmedModel || "—"}` : "Route: project default"}</p>
+      {customRoute && !routeComplete ? <p className="mt-1 text-xs text-destructive">Provider and model are sent as a pair — fill in both, or switch back to the project default.</p> : null}
+    </div>
     <div><label className="mb-1 block text-sm font-medium" htmlFor={`session-name-${workspace.id}`}>Session name <span className="font-normal text-muted-foreground">(optional)</span></label><Input id={`session-name-${workspace.id}`} aria-label="Session name" maxLength={80} value={name} onChange={(event) => setName(event.target.value)} placeholder="Derived from the first line of the prompt" /></div>
     <textarea aria-label="Task prompt" className={`${fieldClass} min-h-28 resize-y`} value={prompt} onChange={(event) => setPrompt(event.target.value)} placeholder="Describe the outcome across these repositories…" />
-    <Button type="submit" disabled={pending || !prompt.trim() || selected.size === 0 || !eligibleHosts.includes(hostId)}><Icon name="Play" className="size-4" />{pending ? "Preparing worktrees…" : "Start thread"}</Button>
+    <Button type="submit" disabled={pending || !prompt.trim() || selected.size === 0 || !eligibleHosts.includes(hostId) || !routeComplete}><Icon name="Play" className="size-4" />{pending ? "Preparing worktrees…" : "Start thread"}</Button>
   </form>;
 }
 

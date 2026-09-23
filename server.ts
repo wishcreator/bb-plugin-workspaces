@@ -60,6 +60,9 @@ export const rpcContract = defineRpcContract({
       name: z.string().trim().min(1).max(80).optional(),
       requestKey: z.string().min(8).max(200),
       bases: z.record(z.string(), baseRefSchema).optional(),
+      providerId: z.string().trim().min(1).optional(),
+      model: z.string().trim().min(1).optional(),
+      permissionMode: z.enum(["accept-edits", "auto", "full"]).optional(),
     }),
     output: sessionSchema,
   },
@@ -283,7 +286,10 @@ export default async function plugin(bb: BbPluginApi) {
     workspace_set_pinned: async ({ id, expectedRevision, pinned }) => { const workspace = store.setPinned(id, expectedRevision, pinned); changed(); return workspace; },
     workspace_set_archived: async ({ id, expectedRevision, archived }) => { const workspace = store.setArchived(id, expectedRevision, archived); changed(); return workspace; },
     workspace_remove: async ({ id, expectedRevision }) => { store.remove(id, expectedRevision); changed(); return { removed: true as const }; },
-    session_start: async ({ workspaceId, expectedRevision, hostId, projectIds, prompt, name, requestKey, bases }) => {
+    session_start: async ({ workspaceId, expectedRevision, hostId, projectIds, prompt, name, requestKey, bases, providerId, model, permissionMode }) => {
+      if ((providerId === undefined) !== (model === undefined)) {
+        throw new Error("Explicit session routing requires both providerId and model");
+      }
       const existing = store.getSessionByRequestKey(requestKey);
       if (existing) return existing;
       const workspace = store.get(workspaceId);
@@ -329,6 +335,7 @@ export default async function plugin(bb: BbPluginApi) {
           projectId: workspaceOwnerProjectId,
           environment: { type: "host", hostId, workspace: { type: "unmanaged", path: prepared.rootPath } },
           prompt, title: `${workspace.name} · ${sessionName}`, visibility: "visible",
+          providerId, model, permissionMode,
         });
         session = store.updateSession(session.id, { state: "active", threadId: thread.id }); changed(); return session;
       } catch (error) {

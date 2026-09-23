@@ -350,6 +350,9 @@ describe("Workspaces plugin server", () => {
       prompt: "Change the auth contract in both services.",
       name: "Auth contract rollout",
       requestKey: "request-auth-contract",
+      providerId: "acp-devin",
+      model: "swe-2-high",
+      permissionMode: "accept-edits",
     }) as { id: string; name: string; state: string; threadId: string };
     const retried = await harness.behavior.callRpc("session_start", {
       workspaceId: workspace.id,
@@ -359,6 +362,9 @@ describe("Workspaces plugin server", () => {
       prompt: "Change the auth contract in both services.",
       name: "Ignored retry name",
       requestKey: "request-auth-contract",
+      providerId: "acp-devin",
+      model: "swe-2-high",
+      permissionMode: "accept-edits",
     }) as { id: string };
 
     expect(session).toMatchObject({
@@ -372,6 +378,9 @@ describe("Workspaces plugin server", () => {
       projectId: "proj_workspaces",
       prompt: "Change the auth contract in both services.",
       title: "Authentication · Auth contract rollout",
+      providerId: "acp-devin",
+      model: "swe-2-high",
+      permissionMode: "accept-edits",
       environment: {
         type: "host",
         hostId: "host_local",
