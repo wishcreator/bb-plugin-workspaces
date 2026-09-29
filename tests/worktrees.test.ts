@@ -12,6 +12,7 @@ import {
   readRepositoryBases,
   readRepositoryStatus,
   readSessionManifest,
+  resolveSessionDataRoot,
 } from "../src/worktrees";
 import { DEFAULT_BASE_REF } from "../src/contracts";
 
@@ -528,5 +529,23 @@ describe("multi-repository session worktrees", () => {
     git(prepared.repositories[0]!.worktreePath, "switch", "-c", "unexpected-branch");
 
     await expect(cleanupSession({ dataRoot, sessionId: "session_switched", repositories: prepared.repositories })).rejects.toThrow(/recorded session branch/i);
+  });
+
+  it("creates a missing sessions data root and keeps legacy sessions in the plugin data dir", async () => {
+    const source = repository("fresh-root");
+    const pluginDataDir = mkdtempSync(join(tmpdir(), "bb-workspaces-plugin-"));
+    const parent = mkdtempSync(join(tmpdir(), "bb-workspaces-sessions-"));
+    roots.push(pluginDataDir, parent);
+    const sessionsDataRoot = join(parent, "missing");
+    mkdirSync(join(pluginDataDir, "sessions", "session_legacy"), { recursive: true });
+
+    expect(resolveSessionDataRoot(pluginDataDir, sessionsDataRoot, "session_legacy")).toBe(pluginDataDir);
+    expect(resolveSessionDataRoot(pluginDataDir, sessionsDataRoot, "session_fresh")).toBe(sessionsDataRoot);
+
+    const prepared = await prepareSession({
+      dataRoot: sessionsDataRoot, sessionId: "session_fresh", workspaceName: "Platform", instructions: "",
+      repositories: [{ projectId: "p1", alias: "api", sourcePath: source.path, baseRef: "main" }],
+    });
+    expect(prepared.rootPath).toBe(join(sessionsDataRoot, "sessions", "session_fresh"));
   });
 });

@@ -1,6 +1,6 @@
 import { execFile } from "node:child_process";
 import { randomUUID } from "node:crypto";
-import { lstatSync, readFileSync, realpathSync } from "node:fs";
+import { existsSync, lstatSync, readFileSync, realpathSync } from "node:fs";
 import { lstat, mkdir, readFile, rename, rm, rmdir, unlink, writeFile } from "node:fs/promises";
 import { basename, dirname, join, resolve } from "node:path";
 import { promisify } from "node:util";
@@ -174,6 +174,12 @@ function ownedPath(dataRoot: string, components: string[]): string {
     }
   }
   return join(declaredRoot, ...components);
+}
+
+/** Sessions created before bb 0.44 live in the plugin data dir, which bb no longer accepts as a thread workspace. */
+export function resolveSessionDataRoot(pluginDataDir: string, sessionsDataRoot: string, sessionId: string): string {
+  assertSafeSessionId(sessionId);
+  return existsSync(join(pluginDataDir, "sessions", sessionId)) ? pluginDataDir : sessionsDataRoot;
 }
 
 function sessionPaths(dataRoot: string, sessionId: string): { sessionsRoot: string; rootPath: string; reposRoot: string } {
@@ -355,6 +361,7 @@ export async function prepareSession(input: {
     aliases.add(repository.alias);
   }
 
+  await mkdir(input.dataRoot, { recursive: true });
   let paths = sessionPaths(input.dataRoot, input.sessionId);
   await mkdir(paths.sessionsRoot, { recursive: true });
   paths = sessionPaths(input.dataRoot, input.sessionId);
