@@ -15,17 +15,31 @@ export const baseRefSchema = z.union([
 export const repositoryDraftSchema = z.object({
   projectId: z.string().trim().min(1),
   alias: z.string().trim().regex(/^[a-z][a-z0-9-]{0,47}$/, "Invalid repository alias"),
+  localPath: z.string().trim().min(1).max(4096).regex(/^(\/|[A-Za-z]:[\\/])/, "Use an absolute repository path").optional(),
+  hostId: z.string().trim().min(1).optional(),
+}).superRefine((value, context) => {
+  if (Boolean(value.localPath) !== Boolean(value.hostId)) context.addIssue({ code: "custom", message: "A local repository needs both path and host" });
+  if (value.localPath && value.projectId !== `local:${value.alias}`) context.addIssue({ code: "custom", message: "Invalid local repository selector" });
+  if (!value.localPath && value.projectId.startsWith("local:")) context.addIssue({ code: "custom", message: "Local selectors require a path and host" });
 });
 
 export const workspaceDraftSchema = z.object({
   name: z.string().trim().min(1).max(80),
   description: z.string().trim().max(2_000),
   instructions: z.string().max(16_000),
+  ownerProjectId: z.string().trim().min(1).optional(),
   repositories: z.array(repositoryDraftSchema).min(1).max(MAX_WORKSPACE_REPOSITORIES),
 }).superRefine((value, context) => {
   const aliases = new Set<string>();
   const projects = new Set<string>();
+  const paths = new Set<string>();
   for (const repository of value.repositories) {
+    if (repository.localPath) {
+      const key = `${repository.hostId}:${repository.localPath.replace(/[\\/]+$/, "")}`;
+      if (paths.has(key)) context.addIssue({ code: "custom", message: "Duplicate local repository path" });
+      paths.add(key);
+      if (!value.ownerProjectId) context.addIssue({ code: "custom", message: "Choose an existing project for local repository threads" });
+    }
     if (aliases.has(repository.alias)) {
       context.addIssue({ code: "custom", path: ["repositories"], message: `Duplicate repository alias: ${repository.alias}` });
     }
@@ -138,6 +152,7 @@ export type SessionSnapshot = {
   rootPath: string | null;
   ownerProjectId: string | null;
   threadId: string | null;
+  writerThreadIds?: string[];
   error: string | null;
   createdAt: number;
   updatedAt: number;

@@ -277,7 +277,7 @@ describe("Workspaces plugin server", () => {
     expect(cli.stdout).not.toMatch(/[\r\n]/);
   });
 
-  it("prepares selected repos and launches one thread at the common root", async () => {
+  it("prepares selected repos and launches in a worktree without creating a project", async () => {
     const hostCalls: Array<{ method: string; input: unknown }> = [];
     const availableProjects = [...projects];
     const { bb, harness } = createFakePluginHost({
@@ -365,19 +365,20 @@ describe("Workspaces plugin server", () => {
       name: "Auth contract rollout",
       state: "active",
       threadId: "thr_multi",
-      ownerProjectId: "proj_workspaces",
+      ownerProjectId: "proj_auth",
       rootPath: expect.stringContaining("/sessions/"),
     });
     expect(harness.inspection.sdk.callsTo("threads.spawn")[0]?.[0]).toMatchObject({
-      projectId: "proj_workspaces",
-      prompt: "Change the auth contract in both services.",
+      projectId: "proj_auth",
+      prompt: expect.stringContaining("Change the auth contract in both services."),
       title: "Authentication · Auth contract rollout",
       environment: {
         type: "host",
         hostId: "host_local",
-        workspace: { type: "unmanaged", path: expect.stringContaining("/sessions/") },
+        workspace: { type: "unmanaged", path: expect.stringMatching(/\/sessions\/[^/]+\/repos\/identity$/) },
       },
     });
+    expect(harness.inspection.sdk.callsTo("projects.create")).toHaveLength(0);
     expect(retried.id).toBe(session.id);
     expect(hostCalls.filter((call) => call.method === "prepare_session")).toHaveLength(1);
     expect(harness.inspection.sdk.callsTo("threads.spawn")).toHaveLength(1);
@@ -395,7 +396,7 @@ describe("Workspaces plugin server", () => {
           { projectId: "proj_workspaces", alias: "workspaces" },
         ],
       },
-    })).rejects.toThrow("cannot be added to a workspace");
+    })).rejects.toThrow("BB project proj_workspaces was not found");
 
     await harness.behavior.callRpc("session_archive", { id: session.id });
     const cleaned = await harness.behavior.callRpc("session_cleanup", { id: session.id });
@@ -409,7 +410,7 @@ describe("Workspaces plugin server", () => {
     });
   });
 
-  it("does not prepare a session when a deleted owner recovers to a selected repository", async () => {
+  it("does not prepare a session when a selected repository project disappears", async () => {
     const hostCalls: string[] = [];
     const recoveredProject = {
       id: "proj_recovered",
@@ -496,7 +497,7 @@ describe("Workspaces plugin server", () => {
       prompt: "Start with identity.",
       requestKey: "request-initial-owner",
     });
-    availableProjects.splice(availableProjects.findIndex((project) => project.id === "proj_deleted"), 1);
+    availableProjects.splice(availableProjects.findIndex((project) => project.id === "proj_recovered"), 1);
     recoveredProject.sources[0]!.path = "/plugin/anchor";
 
     await expect(harness.behavior.callRpc("session_start", {
@@ -506,7 +507,7 @@ describe("Workspaces plugin server", () => {
       projectIds: ["proj_recovered"],
       prompt: "Work on the anchor.",
       requestKey: "request-recovered-owner",
-    })).rejects.toThrow("cannot be selected as a repository");
+    })).rejects.toThrow("BB project proj_recovered was not found");
     expect(hostCalls.filter((method) => method === "prepare_session")).toHaveLength(1);
     expect(harness.inspection.sdk.callsTo("threads.spawn")).toHaveLength(1);
   });

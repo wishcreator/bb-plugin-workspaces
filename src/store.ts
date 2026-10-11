@@ -19,6 +19,7 @@ import {
 } from "./contracts";
 
 type WorkspaceRow = {
+  owner_project_id: string | null;
   id: string;
   name: string;
   description: string;
@@ -30,7 +31,7 @@ type WorkspaceRow = {
   updated_at: number;
 };
 
-type RepoRow = { project_id: string; alias: string; ordinal: number };
+type RepoRow = { project_id: string; alias: string; ordinal: number; repository_json: string | null };
 
 type SessionRow = {
   id: string;
@@ -162,6 +163,15 @@ export const WORKSPACE_MIGRATIONS = [`
   ALTER TABLE sessions ADD COLUMN name TEXT;
 `, `
   ALTER TABLE session_expansions ADD COLUMN base_ref TEXT;
+`, `
+  ALTER TABLE workspaces ADD COLUMN owner_project_id TEXT;
+  ALTER TABLE workspace_repositories ADD COLUMN repository_json TEXT;
+  CREATE TABLE session_writers (
+    request_key TEXT PRIMARY KEY,
+    session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+    project_id TEXT NOT NULL,
+    thread_id TEXT UNIQUE
+  );
 `];
 
 const WORKSPACE_PROJECT_ID_METADATA_KEY = "workspace-project-id";
@@ -193,6 +203,7 @@ export class WorkspaceStore {
         (id, name, description, instructions, revision, pinned, archived_at, created_at, updated_at)
         VALUES (?, ?, ?, ?, 1, 0, NULL, ?, ?)`)
         .run(id, draft.name, draft.description, draft.instructions, now, now);
+      this.db.prepare("UPDATE workspaces SET owner_project_id = ? WHERE id = ?").run(draft.ownerProjectId ?? null, id);
       this.replaceRepositories(id, draft.repositories);
     })();
     return this.get(id);
@@ -207,6 +218,7 @@ export class WorkspaceStore {
         WHERE id = ? AND revision = ?`)
         .run(draft.name, draft.description, draft.instructions, now, id, expectedRevision);
       if (result.changes !== 1) throw new Error("Workspace revision is stale or the workspace no longer exists");
+      this.db.prepare("UPDATE workspaces SET owner_project_id = ? WHERE id = ?").run(draft.ownerProjectId ?? null, id);
       this.replaceRepositories(id, draft.repositories);
     })();
     return this.get(id);
@@ -224,8 +236,8 @@ export class WorkspaceStore {
       }
       if (workspace.repositories.some((candidate) => candidate.alias === draft.alias)) throw new Error(`Duplicate repository alias: ${draft.alias}`);
       if (workspace.repositories.length >= MAX_WORKSPACE_REPOSITORIES) throw new Error(`Workspace repository limit is ${MAX_WORKSPACE_REPOSITORIES}`);
-      this.db.prepare("INSERT INTO workspace_repositories (workspace_id, project_id, alias, ordinal) VALUES (?, ?, ?, ?)")
-        .run(workspaceId, draft.projectId, draft.alias, workspace.repositories.length);
+      this.db.prepare("INSERT INTO workspace_repositories (workspace_id, project_id, alias, ordinal, repository_json) VALUES (?, ?, ?, ?, ?)")
+        .run(workspaceId, draft.projectId, draft.alias, workspace.repositories.length, JSON.stringify(draft));
       this.db.prepare("UPDATE workspaces SET revision = revision + 1, updated_at = ? WHERE id = ?").run(Date.now(), workspaceId);
     })();
     return this.get(workspaceId);
@@ -279,12 +291,32 @@ export class WorkspaceStore {
   }
 
   getSessionByThreadId(threadId: string): SessionSnapshot | null {
-    const row = this.db.prepare("SELECT * FROM sessions WHERE thread_id = ?").get(threadId) as SessionRow | undefined;
+    const row = this.db.prepare("SELECT * FROM sessions WHERE thread_id = ? OR id IN (SELECT session_id FROM session_writers WHERE thread_id = ?) LIMIT 1").get(threadId, threadId) as SessionRow | undefined;
     return row ? this.hydrateSession(row) : null;
   }
 
   hasSessionForThread(threadId: string): boolean {
-    return this.db.prepare("SELECT 1 FROM sessions WHERE thread_id = ?").get(threadId) !== undefined;
+    return this.getSessionByThreadId(threadId) !== null;
+  }
+
+  claimWriter(requestKey: string, sessionId: string, projectId: string): { claimed: boolean; threadId: string | null } {
+    return this.db.transaction(() => {
+      const existing = this.db.prepare("SELECT * FROM session_writers WHERE request_key = ?").get(requestKey) as { session_id: string; project_id: string; thread_id: string | null } | undefined;
+      if (existing) {
+        if (existing.session_id !== sessionId || existing.project_id !== projectId) throw new Error("Writer request key belongs to another repository");
+        return { claimed: false, threadId: existing.thread_id };
+      }
+      this.db.prepare("INSERT INTO session_writers (request_key, session_id, project_id) VALUES (?, ?, ?)").run(requestKey, sessionId, projectId);
+      return { claimed: true, threadId: null };
+    })();
+  }
+
+  completeWriter(requestKey: string, threadId: string): void {
+    this.db.prepare("UPDATE session_writers SET thread_id = ? WHERE request_key = ?").run(threadId, requestKey);
+  }
+
+  hasPendingWriter(sessionId: string, projectId: string): boolean {
+    return Boolean(this.db.prepare("SELECT 1 FROM session_writers WHERE session_id = ? AND project_id = ? AND thread_id IS NULL").get(sessionId, projectId));
   }
 
   getMetadata(key: string): string | null {
@@ -483,8 +515,8 @@ export class WorkspaceStore {
 
   private replaceRepositories(workspaceId: string, repositories: RepositoryDraft[]): void {
     this.db.prepare("DELETE FROM workspace_repositories WHERE workspace_id = ?").run(workspaceId);
-    const insert = this.db.prepare("INSERT INTO workspace_repositories (workspace_id, project_id, alias, ordinal) VALUES (?, ?, ?, ?)");
-    repositories.forEach((repository, ordinal) => insert.run(workspaceId, repository.projectId, repository.alias, ordinal));
+    const insert = this.db.prepare("INSERT INTO workspace_repositories (workspace_id, project_id, alias, ordinal, repository_json) VALUES (?, ?, ?, ?, ?)");
+    repositories.forEach((repository, ordinal) => insert.run(workspaceId, repository.projectId, repository.alias, ordinal, JSON.stringify(repository)));
   }
 
   private patchFlag(id: string, expectedRevision: number, column: "pinned" | "archived_at", value: number | null): Workspace {
@@ -495,11 +527,12 @@ export class WorkspaceStore {
   }
 
   private hydrate(row: WorkspaceRow): Workspace {
-    const repositories = this.db.prepare(`SELECT project_id, alias, ordinal FROM workspace_repositories
+    const repositories = this.db.prepare(`SELECT project_id, alias, ordinal, repository_json FROM workspace_repositories
       WHERE workspace_id = ? ORDER BY ordinal`).all(row.id) as RepoRow[];
     return {
       id: row.id,
       name: row.name,
+      ...(row.owner_project_id ? { ownerProjectId: row.owner_project_id } : {}),
       description: row.description,
       instructions: row.instructions,
       revision: row.revision,
@@ -508,8 +541,7 @@ export class WorkspaceStore {
       createdAt: row.created_at,
       updatedAt: row.updated_at,
       repositories: repositories.map((repository) => ({
-        projectId: repository.project_id,
-        alias: repository.alias,
+        ...(repository.repository_json ? repositoryDraftSchema.parse(JSON.parse(repository.repository_json)) : { projectId: repository.project_id, alias: repository.alias }),
         ordinal: repository.ordinal,
       })),
     };
@@ -517,6 +549,7 @@ export class WorkspaceStore {
 
   private hydrateSession(row: SessionRow): SessionSnapshot {
     const repositories = JSON.parse(row.repositories_json) as SessionRepository[];
+    const writers = this.db.prepare("SELECT thread_id FROM session_writers WHERE session_id = ? AND thread_id IS NOT NULL").all(row.id) as { thread_id: string }[];
     return {
       id: row.id,
       name: row.name ?? null,
@@ -537,6 +570,7 @@ export class WorkspaceStore {
       rootPath: row.root_path,
       ownerProjectId: row.primary_project_id,
       threadId: row.thread_id,
+      ...(writers.length ? { writerThreadIds: writers.map((writer) => writer.thread_id) } : {}),
       error: row.error,
       createdAt: row.created_at,
       updatedAt: row.updated_at,

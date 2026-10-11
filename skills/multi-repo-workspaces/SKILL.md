@@ -9,7 +9,7 @@ A Workspaces session has one common root and an isolated Git worktree for each s
 
 ## Discover the session
 
-1. Read `session.json` at the session root. Treat its repository list as the authoritative scope for this task.
+1. Find the shared session root in the launch prompt; a writer starts inside its repository worktree. Read `session.json` at that shared root. Treat its repository list as the authoritative scope for this task.
 2. Read the root `AGENTS.md` for the repository map and shared workspace guidance.
 3. Before modifying a repository, enter its `repos/<alias>` directory and read every applicable `AGENTS.md` in that repository.
 
@@ -17,6 +17,7 @@ Do not search for or modify sibling repositories that are absent from `session.j
 
 ## Work across repositories
 
+- Your writable working directory is the repository in which this thread started. For a sibling repository, use the Repositories panel to start its writer as a child of the primary session thread; coordinate edits with the parent. Do not change sandbox policy to gain sibling write access.
 - Run Git commands from the specific `repos/<alias>` checkout they apply to. The session root is not itself a Git repository.
 - Keep changes separated by repository and report validation results for each repository.
 - When an interface change spans repositories, update the producer and consumers coherently, then run the narrow tests in every affected checkout.

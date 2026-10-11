@@ -249,6 +249,10 @@ export class SessionExpansionService {
     if (session.repositories.some((repository) => (repository.projectId === expected.projectId || repository.alias === expected.alias) && !(repository.projectId === expected.projectId && repository.alias === expected.alias))) {
       throw new Error(`Repository ${expected.alias} is no longer eligible for this session`);
     }
+    if (member.localPath) {
+      if (member.hostId !== session.hostId) throw new Error(`Repository ${expected.alias} belongs to another host`);
+      return { session, option: { projectId: member.projectId, alias: member.alias, projectName: member.alias, sourcePath: member.localPath } };
+    }
     const project = projects.get(expected.projectId);
     if (!project) throw new Error(`Repository ${expected.alias} is no longer eligible for this session`);
     const source = project.sources.find((candidate) => candidate.hostId === session.hostId && candidate.isDefault)
@@ -287,6 +291,8 @@ export class SessionExpansionService {
   private memberOptions(eligibility: SessionEligibility): ExpansionOption[] {
     return eligibility.workspace.repositories.flatMap((repository) => {
       if (eligibility.presentProjects.has(repository.projectId) || eligibility.presentAliases.has(repository.alias)) return [];
+      if (repository.localPath) return repository.hostId === eligibility.hostId
+        ? [{ projectId: repository.projectId, alias: repository.alias, projectName: repository.alias, sourcePath: repository.localPath }] : [];
       const project = eligibility.projects.get(repository.projectId);
       if (!project) return [];
       const source = this.hostSource(project, eligibility.hostId);

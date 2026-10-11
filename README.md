@@ -1,15 +1,15 @@
 # BB Workspaces
 
-BB Workspaces groups existing BB projects and launches one agent thread across an isolated checkout of each selected repository.
+BB Workspaces groups repositories from existing BB projects or host-local paths and prepares an isolated checkout of each selected repository.
 
 ![The Workspaces page: a workspace, its repositories, and session history](docs/images/overview.png)
 
 The plugin follows a simple model:
 
-- A **workspace** is a reusable, many-to-many grouping of BB projects. It does not modify or replace those projects.
+- A **workspace** is a reusable grouping of repositories. A repository can reference an existing BB project or an absolute path on a selected host. Connecting a path does not create a BB project.
 - A **session** keeps its initial selection as immutable historical context, while its active repository scope can expand append-only.
 - Every selected repository gets its own Git worktree under one session root.
-- New workspace threads are owned by the neutral `Workspace Hub` BB project; no real repository is primary. Thread titles use the workspace and session names, while BB's native icons provide the visual distinction. The thread's unmanaged working directory is the common session root.
+- Workspaces with a chosen **Threads belong to** project launch in the first selected repository worktree. This existing project owns the threads; repository paths remain independent of its configured sources. New project-only workspaces default to their first member project as owner. Legacy workspaces keep their existing Workspace Hub owner and common-root launch behavior; a missing legacy owner requires choosing an existing project instead of creating a replacement.
 - Repository branches survive cleanup. Worktrees are removed only after the session is archived, every working tree is clean, and each checkout is still on its recorded session branch.
 
 ## Use it
@@ -21,7 +21,9 @@ Open **Workspaces** in BB's navigation, create a workspace, and select the exist
 1. Choose the repositories needed for this task. The first task selects all workspace repositories; later tasks remember the user's last subset. This is the session's initial selection and remains historical context even if the active scope later expands.
 2. Optionally enter a session name, then enter the task prompt and select **Start thread**. Without an explicit name, the first non-empty prompt line becomes the session name. Session history shows the name, status, creation time, repository count, and aliases; **Rename** also updates the BB thread title when that thread still exists.
 
-All selected projects must have a source on the same BB host. The new thread starts at a root shaped like:
+To connect repositories on a remote host, choose **Connect a repository by path**, enter the absolute path and alias, and choose the existing project that will own the threads. Saving verifies Git access on that host without fetching. Paths are bound to their hosts and cannot launch on another machine. All selected repositories must be available on the same host. A path connection uses an internal `local:<alias>` selector for storage and RPC; it is not a BB project.
+
+The session context is laid out as:
 
 ```text
 session root/
@@ -33,6 +35,8 @@ session root/
 ```
 
 ![The Repositories panel in a running session](docs/images/session-repositories.png)
+
+For a workspace with an explicit owner, the primary thread starts inside its first repository worktree and reads the shared context from the session root. Use **Start writer in <alias>** in the Repositories panel for another repository: it creates a child of the primary thread, on the same host and in that repository's actual worktree. This gives each writer the correct working directory for the normal command sandbox. Coordinate edits when more than one thread uses a checkout. Writer requests are persisted before spawning; retries return the same thread, or report an uncertain launch instead of duplicating it. After an uncertain launch, inspect the primary thread's children before submitting a new request.
 
 The thread's **Repositories** panel reports each checkout independently, including changed files and commits ahead of the session base. Its **Add repository** action offers the workspace repositories missing from this session, plus every other BB project checked out on the session's host. Picking a workspace repository expands the active session only (append-only). Picking any other project enrolls it in the saved workspace first — under the alias shown in the picker — and then checks it out here, so one action covers both.
 
@@ -79,5 +83,5 @@ The implementation uses only the public BB Plugin SDK and includes a public-SDK 
 - Worktree paths and manifests are validated before cleanup.
 - Cleanup never uses `--force` and never deletes the generated branches.
 - Launches have an idempotency key, preventing UI retries from creating duplicate threads.
-- BB requires a project owner for every thread, so the plugin uses the neutral `Workspace Hub` owner and keeps that implementation detail out of the UI. Real repositories remain peers rather than a primary repository.
+- BB requires a project owner for every thread. Path-based workspaces require an existing owner project. New project-only workspaces default to the first member project. The plugin does not create BB projects; existing Workspace Hub owners remain supported.
 - If thread creation fails after checkout preparation, the failed session remains visible with its worktrees intact.

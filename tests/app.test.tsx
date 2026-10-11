@@ -160,6 +160,26 @@ describe("repository approval interaction", () => {
 describe("Workspaces page", () => {
   beforeEach(() => globalThis.localStorage.clear());
 
+  it("connects a repository path without selecting a repository project", async () => {
+    const app = await loadPluginApp(() => import("../app"));
+    const calls: unknown[] = [];
+    const slot = renderSlot(app.navPanels[0]!, { subPath: "" }, { rpc: {
+      dashboard: () => ({ workspaces: [], sessions: [], projects: [project] }),
+      workspace_create: (input: unknown) => { calls.push(input); return { id: "ws_local", revision: 1 }; },
+    } });
+    fireEvent.click(await slot.findByRole("button", { name: /new workspace/i }));
+    fireEvent.change(slot.getByLabelText("Workspace name"), { target: { value: "Server development" } });
+    fireEvent.change(slot.getByLabelText("Repository path"), { target: { value: "/repos/plugin" } });
+    fireEvent.change(slot.getByLabelText("Repository alias"), { target: { value: "plugin" } });
+    fireEvent.click(slot.getByRole("button", { name: "Connect path" }));
+    expect(slot.getByRole("button", { name: "Create workspace" }).hasAttribute("disabled")).toBe(true);
+    fireEvent.change(slot.getByLabelText("Thread project"), { target: { value: project.id } });
+    fireEvent.click(slot.getByRole("button", { name: "Create workspace" }));
+    await expect.poll(() => calls.length).toBe(1);
+    expect(calls[0]).toMatchObject({ ownerProjectId: project.id, repositories: [{ projectId: "local:plugin", alias: "plugin", hostId: "host_local", localPath: "/repos/plugin" }] });
+    slot.lifecycle.unmount();
+  });
+
   it("creates a workspace from selected BB projects", async () => {
     const app = await loadPluginApp(() => import("../app"));
     const calls: unknown[] = [];
@@ -209,7 +229,7 @@ describe("Workspaces page", () => {
     expect(slot.getByText("10 / 100 selected")).toBeTruthy();
     fireEvent.click(slot.getByRole("button", { name: "Selected repositories" }));
     expect(slot.getAllByRole("checkbox")).toHaveLength(10);
-    expect(slot.getByText("service-240")).toBeTruthy();
+    expect(slot.getByRole("checkbox", { name: "service-240" })).toBeTruthy();
     fireEvent.click(slot.getByRole("button", { name: "Clear visible" }));
     expect(slot.getByText("0 / 100 selected")).toBeTruthy();
     slot.lifecycle.unmount();
@@ -353,6 +373,22 @@ describe("Workspaces page", () => {
 });
 
 describe("Repositories panel", () => {
+  it("recognizes a child writer and launches another writer from its repository panel", async () => {
+    const app = await loadPluginApp(() => import("../app"));
+    const calls: unknown[] = [];
+    const session = { ...activeSession, writerThreadIds: ["thr_child"] };
+    const slot = renderSlot(app.threadPanelActions[0]!, { threadId: "thr_child", params: null }, { rpc: {
+      dashboard: () => ({ workspaces: [workspace], sessions: [session], projects: [project] }),
+      session_expansion_options: () => ({ session, repositories: [] }),
+      session_writer_start: (input: unknown) => { calls.push(input); return { threadId: "thr_writer" }; },
+    } });
+    fireEvent.change(await slot.findByLabelText("Task for identity"), { target: { value: "Update contract" } });
+    fireEvent.click(slot.getByRole("button", { name: "Start writer in identity" }));
+    await expect.poll(() => calls.length).toBe(1);
+    expect(calls[0]).toMatchObject({ sessionId: session.id, projectId: "proj_auth", prompt: "Update contract" });
+    slot.lifecycle.unmount();
+  });
+
   it("keeps a pending request retryable when reconciliation removes its option", async () => {
     const app = await loadPluginApp(() => import("../app"));
     const calls: Array<{ requestKey: string }> = [];

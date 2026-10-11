@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState, type FormEvent, type ReactNode } from "react";
 import { definePluginApp, useBbNavigate, useRealtime, useRpc, type PluginPendingInteractionProps } from "@get-bb/plugin-sdk/app";
 import type { rpcContract } from "./server";
-import { expansionApprovalPayloadSchema, expansionApprovalResponseSchema, uniqueAlias, DEFAULT_BASE_REF, MAX_WORKSPACE_REPOSITORIES, type SessionSnapshot, type Workspace, type WorkspaceDraft } from "./src/contracts";
+import { expansionApprovalPayloadSchema, expansionApprovalResponseSchema, uniqueAlias, DEFAULT_BASE_REF, MAX_WORKSPACE_REPOSITORIES, type SessionSnapshot, type Workspace, type WorkspaceDraft, type RepositoryDraft, repositoryDraftSchema } from "./src/contracts";
 import { Button } from "@/components/ui/button";
 import { Checkbox } from "@/components/ui/checkbox";
 import { Dialog, DialogContent, DialogDescription, DialogHeader, DialogTitle } from "@/components/ui/dialog";
@@ -29,15 +29,15 @@ function baseOptions(bases: RepositoryBases): Array<{ value: string; label: stri
 }
 
 /** Loads each repository's candidate bases, fetching remotes so the default branch is current. */
-function useRepositoryBases(rpc: ReturnType<typeof useRpc<typeof rpcContract>>, hostId: string, projectIds: string[]) {
+function useRepositoryBases(rpc: ReturnType<typeof useRpc<typeof rpcContract>>, hostId: string, projectIds: string[], workspaceId?: string) {
   const [bases, setBases] = useState<Record<string, RepositoryBases> | null>(null);
   const [error, setError] = useState<string | null>(null);
-  const key = `${hostId}:${[...projectIds].sort().join(",")}`;
+  const key = `${workspaceId ?? ""}:${hostId}:${[...projectIds].sort().join(",")}`;
   const latest = useRef("");
   useEffect(() => {
     if (!hostId || projectIds.length === 0) { setBases(null); return; }
     latest.current = key; setBases(null); setError(null);
-    rpc.call("repository_bases", { hostId, projectIds, fetch: true }).then(
+    rpc.call("repository_bases", { hostId, projectIds, fetch: true, ...(workspaceId ? { workspaceId } : {}) }).then(
       (result) => { if (latest.current !== key) return; setBases(Object.fromEntries(result.repositories.map((row) => [row.projectId, row]))); },
       (cause) => { if (latest.current !== key) return; setError(cause instanceof Error ? cause.message : String(cause)); },
     );
@@ -73,7 +73,22 @@ function WorkspaceForm({ projects, initial, onCancel, onSave }: {
   const [name, setName] = useState(initial?.name ?? "");
   const [description, setDescription] = useState(initial?.description ?? "");
   const [instructions, setInstructions] = useState(initial?.instructions ?? "");
-  const [selected, setSelected] = useState(() => new Set(initial?.repositories.map((repo) => repo.projectId) ?? []));
+  const [selected, setSelected] = useState(() => new Set(initial?.repositories.filter((repo) => !repo.localPath).map((repo) => repo.projectId) ?? []));
+  const [localRepositories, setLocalRepositories] = useState<RepositoryDraft[]>(initial?.repositories.filter((repo) => repo.localPath) ?? []);
+  const [ownerProjectId, setOwnerProjectId] = useState(initial?.ownerProjectId ?? "");
+  const hosts = [...new Set(projects.flatMap((project) => project.sources.map((source) => source.hostId)))];
+  const [localHost, setLocalHost] = useState(hosts[0] ?? "");
+  const [localPath, setLocalPath] = useState("");
+  const [localAlias, setLocalAlias] = useState("");
+  const totalSelected = selected.size + localRepositories.length;
+  const addLocal = () => {
+    const alias = localAlias.trim();
+    const parsed = repositoryDraftSchema.safeParse({ projectId: `local:${alias}`, alias, hostId: localHost, localPath });
+    if (!parsed.success) { setSelectionMessage(parsed.error.issues[0]?.message ?? "Check repository details"); return; }
+    if (totalSelected >= MAX_WORKSPACE_REPOSITORIES) { setSelectionMessage("Repository limit reached."); return; }
+    if (localRepositories.some((repo) => repo.alias === alias || (repo.hostId === localHost && repo.localPath?.replace(/[\\/]+$/, "") === parsed.data.localPath?.replace(/[\\/]+$/, "")))) { setSelectionMessage("This repository path or alias is already connected."); return; }
+    setLocalRepositories((current) => [...current, parsed.data]); setLocalPath(""); setLocalAlias(""); setSelectionMessage(null);
+  };
   const [repositoryQuery, setRepositoryQuery] = useState("");
   const [repositoryFilter, setRepositoryFilter] = useState<"all" | "selected">("all");
   const [selectionMessage, setSelectionMessage] = useState<string | null>(null);
@@ -91,7 +106,7 @@ function WorkspaceForm({ projects, initial, onCancel, onSave }: {
     setSelected((current) => {
       const next = new Set(current);
       if (!checked) next.delete(projectId);
-      else if (next.size < MAX_WORKSPACE_REPOSITORIES) next.add(projectId);
+      else if (next.size + localRepositories.length < MAX_WORKSPACE_REPOSITORIES) next.add(projectId);
       else setSelectionMessage(`A workspace can contain at most ${MAX_WORKSPACE_REPOSITORIES} repositories.`);
       return next;
     });
@@ -102,7 +117,7 @@ function WorkspaceForm({ projects, initial, onCancel, onSave }: {
       let skipped = 0;
       for (const project of visibleProjects) {
         if (next.has(project.id)) continue;
-        if (next.size >= MAX_WORKSPACE_REPOSITORIES) skipped += 1;
+        if (next.size + localRepositories.length >= MAX_WORKSPACE_REPOSITORIES) skipped += 1;
         else next.add(project.id);
       }
       setSelectionMessage(skipped > 0
@@ -121,17 +136,17 @@ function WorkspaceForm({ projects, initial, onCancel, onSave }: {
   };
   const submit = async (event: FormEvent) => {
     event.preventDefault();
-    if (!name.trim() || selected.size === 0 || pending) return;
+    if (!name.trim() || totalSelected === 0 || (localRepositories.length > 0 && !ownerProjectId) || pending) return;
     setPending(true);
     try {
-      const used = new Set<string>();
+      const used = new Set<string>(localRepositories.map((repo) => repo.alias));
       const repositories = projects.filter((project) => selected.has(project.id)).map((project) => {
         const existing = initial?.repositories.find((repo) => repo.projectId === project.id)?.alias;
         const alias = existing && !used.has(existing) ? existing : uniqueAlias(project.name, used);
         used.add(alias);
         return { projectId: project.id, alias };
       });
-      await onSave({ name: name.trim(), description: description.trim(), instructions, repositories });
+      await onSave({ name: name.trim(), description: description.trim(), instructions, repositories: [...repositories, ...localRepositories], ...(ownerProjectId ? { ownerProjectId } : {}) });
     } finally { setPending(false); }
   };
   return (
@@ -139,7 +154,15 @@ function WorkspaceForm({ projects, initial, onCancel, onSave }: {
       <div><label className="mb-1 block text-sm font-medium" htmlFor="workspace-name">Workspace name</label><Input id="workspace-name" aria-label="Workspace name" value={name} onChange={(event) => setName(event.target.value)} autoFocus /></div>
       <div><label className="mb-1 block text-sm font-medium" htmlFor="workspace-description">Description</label><Input id="workspace-description" value={description} onChange={(event) => setDescription(event.target.value)} /></div>
       <div><label className="mb-1 block text-sm font-medium" htmlFor="workspace-instructions">Shared instructions</label><textarea id="workspace-instructions" className={`${fieldClass} min-h-24 resize-y`} value={instructions} onChange={(event) => setInstructions(event.target.value)} placeholder="Context that applies whenever these repositories are used together" /></div>
-      <fieldset className="space-y-2"><legend className="sr-only">Repositories</legend><div className="flex items-center justify-between gap-3"><span className="text-sm font-medium">Repositories</span><span className="text-xs tabular-nums text-muted-foreground">{selected.size} / {MAX_WORKSPACE_REPOSITORIES} selected</span></div>
+      <fieldset className="space-y-2 rounded-md border border-border p-3"><legend className="text-sm font-medium">Connect a repository by path</legend>
+        <label className="block text-sm">Host<select aria-label="Repository host" className={fieldClass} value={localHost} onChange={(event) => setLocalHost(event.target.value)}>{hosts.map((id) => <option key={id} value={id}>{id}</option>)}</select></label>
+        <Input aria-label="Repository path" placeholder="Absolute path on the selected host" value={localPath} onChange={(event) => setLocalPath(event.target.value)} />
+        <Input aria-label="Repository alias" placeholder="Alias, e.g. infrastructure" value={localAlias} onChange={(event) => setLocalAlias(event.target.value)} />
+        <Button type="button" variant="outline" onClick={addLocal}>Connect path</Button>
+        {localRepositories.map((repo) => <div key={repo.projectId} className="flex items-center justify-between gap-2 text-sm"><span className="break-all">{repo.alias} · {repo.hostId} · {repo.localPath}</span><Button type="button" variant="ghost" size="sm" aria-label={`Remove ${repo.alias}`} onClick={() => setLocalRepositories((current) => current.filter((item) => item.projectId !== repo.projectId))}>Remove</Button></div>)}
+        <label className="block text-sm">Threads belong to<select aria-label="Thread project" className={fieldClass} value={ownerProjectId} onChange={(event) => setOwnerProjectId(event.target.value)}><option value="">Choose an existing project</option>{projects.map((project) => <option key={project.id} value={project.id}>{project.name}</option>)}</select></label>
+      </fieldset>
+      <fieldset className="space-y-2"><legend className="sr-only">Repositories</legend><div className="flex items-center justify-between gap-3"><span className="text-sm font-medium">Repositories</span><span className="text-xs tabular-nums text-muted-foreground">{totalSelected} / {MAX_WORKSPACE_REPOSITORIES} selected</span></div>
         <Input type="search" aria-label="Search repositories" placeholder="Search by repository name or path…" value={repositoryQuery} onChange={(event) => setRepositoryQuery(event.target.value)} />
         <div className="flex flex-wrap items-center justify-between gap-2">
           <div className="flex gap-1" aria-label="Repository filters"><Button type="button" size="sm" variant={repositoryFilter === "all" ? "secondary" : "ghost"} onClick={() => setRepositoryFilter("all")}>All repositories</Button><Button type="button" size="sm" variant={repositoryFilter === "selected" ? "secondary" : "ghost"} onClick={() => setRepositoryFilter("selected")}>Selected repositories</Button></div>
@@ -148,12 +171,12 @@ function WorkspaceForm({ projects, initial, onCancel, onSave }: {
         {selectionMessage ? <p role="status" className="text-xs text-muted-foreground">{selectionMessage}</p> : null}
         <div className="max-h-72 space-y-1 overflow-y-auto rounded-md border border-border p-2">
           {visibleProjects.length === 0 ? <p className="px-2 py-6 text-center text-sm text-muted-foreground">No repositories match this view.</p> : visibleProjects.map((project) => <label key={project.id} className="flex cursor-pointer items-start gap-3 rounded px-2 py-2 hover:bg-muted/60">
-            <Checkbox checked={selected.has(project.id)} disabled={!selected.has(project.id) && selected.size >= MAX_WORKSPACE_REPOSITORIES} onCheckedChange={(checked) => toggleRepository(project.id, checked === true)} aria-label={project.name} />
+            <Checkbox checked={selected.has(project.id)} disabled={!selected.has(project.id) && totalSelected >= MAX_WORKSPACE_REPOSITORIES} onCheckedChange={(checked) => toggleRepository(project.id, checked === true)} aria-label={project.name} />
             <span className="min-w-0"><span className="block text-sm font-medium">{project.name}</span><span className="block truncate text-xs text-muted-foreground">{project.sources[0]?.path ?? "No source configured"}</span></span>
           </label>)}
         </div>
       </fieldset>
-      <div className="flex justify-end gap-2"><Button type="button" variant="ghost" onClick={onCancel}>Cancel</Button><Button type="submit" disabled={pending || !name.trim() || selected.size === 0}>{initial ? "Save workspace" : "Create workspace"}</Button></div>
+      <div className="flex justify-end gap-2"><Button type="button" variant="ghost" onClick={onCancel}>Cancel</Button><Button type="submit" disabled={pending || !name.trim() || totalSelected === 0 || (localRepositories.length > 0 && !ownerProjectId)}>{initial ? "Save workspace" : "Create workspace"}</Button></div>
     </form>
   );
 }
@@ -176,7 +199,7 @@ function rememberedSelection(workspaceId: string, projectIds: string[]): Set<str
 
 function SessionLauncher({ workspace, projects, rpc, onError }: { workspace: Workspace; projects: Project[]; rpc: ReturnType<typeof useRpc<typeof rpcContract>>; onError: (message: string) => void }) {
   const navigate = useBbNavigate();
-  const memberProjects = workspace.repositories.map((member) => projects.find((project) => project.id === member.projectId)).filter((project): project is Project => Boolean(project));
+  const memberProjects = workspace.repositories.map((member) => member.localPath ? { id: member.projectId, name: member.alias, gitRemoteUrl: null, sources: [{ id: member.projectId, hostId: member.hostId!, path: member.localPath, isDefault: true }] } : projects.find((project) => project.id === member.projectId)).filter((project): project is Project => Boolean(project));
   const [selected, setSelected] = useState(() => rememberedSelection(workspace.id, memberProjects.map((project) => project.id)));
   const [name, setName] = useState("");
   const [prompt, setPrompt] = useState("");
@@ -194,7 +217,7 @@ function SessionLauncher({ workspace, projects, rpc, onError }: { workspace: Wor
   }, [selected, workspace.id]);
   useEffect(() => { if (!eligibleHosts.includes(hostId)) setHostId(eligibleHosts[0] ?? ""); }, [eligibleHosts, hostId]);
   const selectedIds = useMemo(() => memberProjects.filter((project) => selected.has(project.id)).map((project) => project.id), [memberProjects, selected]);
-  const { bases, error: basesError } = useRepositoryBases(rpc, hostId, selectedIds);
+  const { bases, error: basesError } = useRepositoryBases(rpc, hostId, selectedIds, workspace.id);
   const [chosenBases, setChosenBases] = useState<Record<string, string>>({});
   const [showBases, setShowBases] = useState(false);
   useEffect(() => { setChosenBases({}); }, [bases]);
@@ -364,7 +387,7 @@ function WorkspacesPage() {
   return <div className="h-full min-h-0 flex-1 overflow-y-auto"><div className="mx-auto w-full max-w-5xl space-y-4 px-4 pb-8 pt-4">
     <div className="flex items-start justify-between gap-3"><div><h1 className="text-xl font-semibold">Workspaces</h1><p className="text-sm text-muted-foreground">Group related repositories and run one isolated task across the ones you choose.</p></div><Button onClick={() => setEditing("new")}><Icon name="Plus" className="size-4" />New workspace</Button></div>
     {error ? <p role="alert" className="rounded-md bg-destructive/10 px-3 py-2 text-sm text-destructive">{error}</p> : null}
-    <Dialog open={editing !== null} onOpenChange={(open) => { if (!open) setEditing(null); }}><DialogContent className="max-h-[90vh] overflow-y-auto sm:grid-rows-[auto_minmax(0,1fr)] sm:overflow-hidden sm:max-w-2xl">{editing ? <><DialogHeader><DialogTitle>{editing === "new" ? "Create workspace" : "Edit workspace"}</DialogTitle><DialogDescription>Choose the BB projects that should be available together.</DialogDescription></DialogHeader><WorkspaceForm projects={dashboard?.projects ?? []} initial={editing === "new" ? undefined : editing} onCancel={() => setEditing(null)} onSave={async (draft) => { try { editing === "new" ? await rpc.call("workspace_create", draft) : await rpc.call("workspace_update", { id: editing.id, expectedRevision: editing.revision, draft }); setEditing(null); load(); } catch (cause) { setError(cause instanceof Error ? cause.message : String(cause)); } }} /></> : null}</DialogContent></Dialog>
+    <Dialog open={editing !== null} onOpenChange={(open) => { if (!open) setEditing(null); }}><DialogContent className="max-h-[90vh] overflow-y-auto sm:grid-rows-[auto_minmax(0,1fr)] sm:overflow-hidden sm:max-w-2xl">{editing ? <><DialogHeader><DialogTitle>{editing === "new" ? "Create workspace" : "Edit workspace"}</DialogTitle><DialogDescription>Connect repositories by host and path, or select existing projects.</DialogDescription></DialogHeader><WorkspaceForm projects={dashboard?.projects ?? []} initial={editing === "new" ? undefined : editing} onCancel={() => setEditing(null)} onSave={async (draft) => { try { editing === "new" ? await rpc.call("workspace_create", draft) : await rpc.call("workspace_update", { id: editing.id, expectedRevision: editing.revision, draft }); setEditing(null); load(); } catch (cause) { setError(cause instanceof Error ? cause.message : String(cause)); } }} /></> : null}</DialogContent></Dialog>
     {dashboard === null ? <Empty>Loading workspaces…</Empty> : workspaces.length === 0 && !editing ? <Empty>No workspaces yet. Create one to group repositories.</Empty> : <div className="grid gap-4 md:grid-cols-[minmax(240px,0.75fr)_minmax(0,1.6fr)]">
       <aside className="self-start md:sticky md:top-4"><div className="space-y-2 rounded-lg border border-border bg-card p-2"><Input type="search" aria-label="Search workspaces" placeholder="Search workspaces…" value={workspaceQuery} onChange={(event) => setWorkspaceQuery(event.target.value)} /><div className="grid grid-cols-3 gap-1" aria-label="Workspace filters"><Button type="button" size="sm" variant={workspaceFilter === "active" ? "secondary" : "ghost"} onClick={() => setWorkspaceFilter("active")}>Active {activeCount}</Button><Button type="button" size="sm" variant={workspaceFilter === "pinned" ? "secondary" : "ghost"} onClick={() => setWorkspaceFilter("pinned")}>Pinned {pinnedCount}</Button><Button type="button" size="sm" variant={workspaceFilter === "archived" ? "secondary" : "ghost"} onClick={() => setWorkspaceFilter("archived")}>Archived {archivedCount}</Button></div><div className="max-h-[calc(100vh-14rem)] space-y-2 overflow-y-auto pr-1">{visibleWorkspaces.map((workspace) => <button data-testid="workspace-navigation-item" key={workspace.id} onClick={() => setSelectedId(workspace.id)} className={`w-full rounded-lg border p-3 text-left ${selected?.id === workspace.id ? "border-foreground bg-muted" : "border-border bg-card hover:bg-muted/60"}`}><span className="flex items-center justify-between gap-2"><span className="truncate font-medium">{workspace.name}</span>{workspace.pinned ? <Icon name="Pin" className="size-3.5 shrink-0 text-muted-foreground" /> : null}</span><span className="mt-1 block text-xs text-muted-foreground">{workspace.repositories.length} repositories</span></button>)}{visibleWorkspaces.length === 0 ? <div className="px-2 py-6 text-center text-sm text-muted-foreground">{workspaceQuery.trim() ? "No matching workspaces." : `No ${workspaceFilter} workspaces.`}</div> : null}{filteredWorkspaces.length > visibleWorkspaces.length ? <Button type="button" variant="ghost" className="w-full" onClick={() => setVisibleWorkspaceCount((count) => count + 50)}>Show 50 more workspaces</Button> : null}</div></div></aside>
       {selected ? <main className="space-y-4"><div className="rounded-lg border border-border bg-card p-4"><div className="flex items-start justify-between gap-2"><div><h2 className="text-lg font-semibold">{selected.name}</h2><p className="text-sm text-muted-foreground">{selected.description || "No description"}</p></div><div className="flex gap-1">{selected.archivedAt === null ? <><Button variant="ghost" size="sm" onClick={() => setEditing(selected)}>Edit</Button><Button variant="ghost" size="sm" onClick={() => mutateWorkspace(() => rpc.call("workspace_set_pinned", { id: selected.id, expectedRevision: selected.revision, pinned: !selected.pinned }))}>{selected.pinned ? "Unpin" : "Pin"}</Button><Button variant="ghost" size="sm" onClick={async () => { await mutateWorkspace(() => rpc.call("workspace_set_archived", { id: selected.id, expectedRevision: selected.revision, archived: true })); setSelectedId(null); }}>Archive</Button></> : <><Button variant="outline" size="sm" onClick={() => mutateWorkspace(() => rpc.call("workspace_set_archived", { id: selected.id, expectedRevision: selected.revision, archived: false }))}>Restore</Button><Button variant="ghost" size="sm" onClick={() => { if (globalThis.confirm(`Delete workspace “${selected.name}”? Its session history will remain.`)) void mutateWorkspace(() => rpc.call("workspace_remove", { id: selected.id, expectedRevision: selected.revision })); }}>Delete</Button></>}</div></div><div className="mt-3 flex flex-wrap gap-2">{selected.repositories.map((repository) => <span key={repository.projectId} className="rounded-full bg-muted px-2.5 py-1 text-xs">{repository.alias}</span>)}</div></div>
@@ -375,9 +398,28 @@ function WorkspacesPage() {
   </div></div>;
 }
 
+function RepositoryWriter({ session, projectId, alias, rpc }: { session: SessionSnapshot; projectId: string; alias: string; rpc: ReturnType<typeof useRpc<typeof rpcContract>> }) {
+  const navigate = useBbNavigate();
+  const [prompt, setPrompt] = useState("");
+  const [pending, setPending] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const [requestKey, setRequestKey] = useState(() => `writer-${Date.now()}-${Math.random().toString(36).slice(2)}`);
+  if (session.state !== "active") return null;
+  const launch = async (event: FormEvent) => {
+    event.preventDefault(); if (!prompt.trim() || pending) return;
+    setPending(true); setError(null);
+    try {
+      const result = await rpc.call("session_writer_start", { sessionId: session.id, projectId, prompt, requestKey });
+      setRequestKey(`writer-${Date.now()}-${Math.random().toString(36).slice(2)}`); setPrompt(""); navigate.toThread(result.threadId);
+    } catch (cause) { setError(cause instanceof Error ? cause.message : String(cause)); }
+    finally { setPending(false); }
+  };
+  return <form onSubmit={launch} className="mt-3 space-y-2"><Input aria-label={`Task for ${alias}`} placeholder={`Task for a child thread in ${alias}`} value={prompt} onChange={(event) => setPrompt(event.target.value)} /><Button type="submit" size="sm" variant="outline" disabled={pending || !prompt.trim()}>{pending ? "Starting…" : `Start writer in ${alias}`}</Button>{error ? <p role="alert" className="text-xs text-destructive">{error}</p> : null}</form>;
+}
+
 function RepositoriesPanel({ threadId }: { threadId: string }) {
   const { rpc, dashboard, error, load } = useDashboard();
-  const session = dashboard?.sessions.find((candidate) => candidate.threadId === threadId);
+  const session = dashboard?.sessions.find((candidate) => candidate.threadId === threadId || candidate.writerThreadIds?.includes(threadId));
   const [statuses, setStatuses] = useState<Record<string, { loading?: boolean; error?: string; clean?: boolean; aheadOfBase?: boolean; changedFiles?: Array<{ path: string; status: string }> }>>({});
   const [options, setOptions] = useState<ExpansionOption[] | null>(null);
   const [optionsSessionState, setOptionsSessionState] = useState<SessionSnapshot["state"] | null>(null);
@@ -387,7 +429,7 @@ function RepositoriesPanel({ threadId }: { threadId: string }) {
   const [adding, setAdding] = useState(false);
   const [baseRef, setBaseRef] = useState(DEFAULT_BASE_REF);
   const baseRefRef = useRef(DEFAULT_BASE_REF);
-  const { bases: addBases } = useRepositoryBases(rpc, showAddForm ? session?.hostId ?? "" : "", showAddForm && selectedProjectId ? [selectedProjectId] : []);
+  const { bases: addBases } = useRepositoryBases(rpc, showAddForm ? session?.hostId ?? "" : "", showAddForm && selectedProjectId ? [selectedProjectId] : [], session?.workspaceId ?? undefined);
   const requestKey = useRef<string | null>(null);
   const submittedOption = useRef<ExpansionOption | null>(null);
   const generation = useRef(0);
@@ -488,7 +530,7 @@ function RepositoriesPanel({ threadId }: { threadId: string }) {
   const memberOptions = displayedOptions?.filter((option) => option.member) ?? [];
   const otherOptions = displayedOptions?.filter((option) => !option.member) ?? [];
   const pendingOption = displayedOptions?.find((option) => option.projectId === selectedProjectId);
-  return <div className="space-y-3"><div className="rounded-lg border border-border p-3"><div className="flex items-center justify-between gap-2"><div><h2 className="font-medium">Add a repository</h2><p className="text-xs text-muted-foreground">Workspace repositories are checked out directly. Any other project joins the workspace first, then this session.</p></div>{activeForAddition && options && options.length > 0 && !showAddForm ? <Button size="sm" onClick={openAddForm}>Add repository</Button> : null}</div>{activeForAddition && options?.length === 0 ? <p className="mt-2 text-sm text-muted-foreground">Every project on this session’s host is already checked out here.</p> : null}{optionsError ? <p role="alert" className="mt-2 text-sm text-destructive">{optionsError}</p> : null}{showAddForm && activeForAddition ? <form className="mt-3 flex flex-wrap items-end gap-2" onSubmit={addRepository}><label className="text-sm" htmlFor="repository-to-add">Repository to add<select id="repository-to-add" className={`${fieldClass} mt-1`} value={selectedProjectId} onChange={(event) => changeTarget(event.target.value)} disabled={adding}>{memberOptions.length ? <optgroup label="In this workspace">{memberOptions.map((option) => <option key={option.projectId} value={option.projectId}>{option.alias} — {option.projectName}</option>)}</optgroup> : null}{otherOptions.length ? <optgroup label="Other projects">{otherOptions.map((option) => <option key={option.projectId} value={option.projectId}>{option.alias} — {option.projectName}</option>)}</optgroup> : null}</select></label>{addBases?.[selectedProjectId] ? <label className="text-sm" htmlFor="repository-base">Branch from<select id="repository-base" className={`${fieldClass} mt-1`} value={baseRef} onChange={(event) => changeBase(event.target.value)} disabled={adding}>{baseOptions(addBases[selectedProjectId]!).map((option) => <option key={option.value} value={option.value}>{option.label}</option>)}</select></label> : null}<Button type="submit" disabled={adding || !selectedProjectId}>{adding ? "Adding…" : "Add selected repository"}</Button><Button type="button" variant="ghost" disabled={adding} onClick={() => closeAddForm()}>Cancel</Button>{pendingOption && !pendingOption.member ? <p className="w-full text-xs text-muted-foreground">{pendingOption.projectName} also joins workspace “{session.workspaceName}” as {pendingOption.alias}.</p> : null}</form> : null}</div>{session.repositories.map((repository) => { const status = statuses[repository.projectId]; return <section key={repository.projectId} className="rounded-lg border border-border p-3"><div className="flex items-center justify-between gap-2"><div><h3 className="font-medium">{repository.alias}</h3><p className="font-mono text-xs text-muted-foreground">{repository.branch ?? repository.worktreePath}</p>{repository.baseRef ? <p className="text-xs text-muted-foreground">from {repository.baseRef}{repository.baseCommit ? ` · ${repository.baseCommit.slice(0, 8)}` : ""}</p> : null}</div><Button variant="outline" size="sm" onClick={() => refresh(repository.projectId)} disabled={status?.loading}>{status?.loading ? "Refreshing…" : "Refresh"}</Button></div>{status?.error ? <p className="mt-2 text-xs text-destructive">{status.error}</p> : status?.changedFiles ? <div className="mt-2"><p className="text-xs text-muted-foreground">{status.clean ? "Clean" : `${status.changedFiles.length} changed files${status.aheadOfBase ? ", commits ahead" : ""}`}</p><ul className="mt-1 space-y-1">{status.changedFiles.map((file) => <li key={`${file.status}:${file.path}`} className="flex gap-2 text-xs"><span className="w-16 text-muted-foreground">{file.status}</span><code className="min-w-0 break-all">{file.path}</code></li>)}</ul></div> : null}</section>; })}</div>;
+  return <div className="space-y-3"><div className="rounded-lg border border-border p-3"><div className="flex items-center justify-between gap-2"><div><h2 className="font-medium">Add a repository</h2><p className="text-xs text-muted-foreground">Workspace repositories are checked out directly. Any other project joins the workspace first, then this session.</p></div>{activeForAddition && options && options.length > 0 && !showAddForm ? <Button size="sm" onClick={openAddForm}>Add repository</Button> : null}</div>{activeForAddition && options?.length === 0 ? <p className="mt-2 text-sm text-muted-foreground">Every project on this session’s host is already checked out here.</p> : null}{optionsError ? <p role="alert" className="mt-2 text-sm text-destructive">{optionsError}</p> : null}{showAddForm && activeForAddition ? <form className="mt-3 flex flex-wrap items-end gap-2" onSubmit={addRepository}><label className="text-sm" htmlFor="repository-to-add">Repository to add<select id="repository-to-add" className={`${fieldClass} mt-1`} value={selectedProjectId} onChange={(event) => changeTarget(event.target.value)} disabled={adding}>{memberOptions.length ? <optgroup label="In this workspace">{memberOptions.map((option) => <option key={option.projectId} value={option.projectId}>{option.alias} — {option.projectName}</option>)}</optgroup> : null}{otherOptions.length ? <optgroup label="Other projects">{otherOptions.map((option) => <option key={option.projectId} value={option.projectId}>{option.alias} — {option.projectName}</option>)}</optgroup> : null}</select></label>{addBases?.[selectedProjectId] ? <label className="text-sm" htmlFor="repository-base">Branch from<select id="repository-base" className={`${fieldClass} mt-1`} value={baseRef} onChange={(event) => changeBase(event.target.value)} disabled={adding}>{baseOptions(addBases[selectedProjectId]!).map((option) => <option key={option.value} value={option.value}>{option.label}</option>)}</select></label> : null}<Button type="submit" disabled={adding || !selectedProjectId}>{adding ? "Adding…" : "Add selected repository"}</Button><Button type="button" variant="ghost" disabled={adding} onClick={() => closeAddForm()}>Cancel</Button>{pendingOption && !pendingOption.member ? <p className="w-full text-xs text-muted-foreground">{pendingOption.projectName} also joins workspace “{session.workspaceName}” as {pendingOption.alias}.</p> : null}</form> : null}</div>{session.repositories.map((repository) => { const status = statuses[repository.projectId]; return <section key={repository.projectId} className="rounded-lg border border-border p-3"><div className="flex items-center justify-between gap-2"><div><h3 className="font-medium">{repository.alias}</h3><p className="font-mono text-xs text-muted-foreground">{repository.branch ?? repository.worktreePath}</p>{repository.baseRef ? <p className="text-xs text-muted-foreground">from {repository.baseRef}{repository.baseCommit ? ` · ${repository.baseCommit.slice(0, 8)}` : ""}</p> : null}</div><Button variant="outline" size="sm" onClick={() => refresh(repository.projectId)} disabled={status?.loading}>{status?.loading ? "Refreshing…" : "Refresh"}</Button></div>{status?.error ? <p className="mt-2 text-xs text-destructive">{status.error}</p> : status?.changedFiles ? <div className="mt-2"><p className="text-xs text-muted-foreground">{status.clean ? "Clean" : `${status.changedFiles.length} changed files${status.aheadOfBase ? ", commits ahead" : ""}`}</p><ul className="mt-1 space-y-1">{status.changedFiles.map((file) => <li key={`${file.status}:${file.path}`} className="flex gap-2 text-xs"><span className="w-16 text-muted-foreground">{file.status}</span><code className="min-w-0 break-all">{file.path}</code></li>)}</ul></div> : null}<RepositoryWriter session={session} projectId={repository.projectId} alias={repository.alias} rpc={rpc} /></section>; })}</div>;
 }
 
 export default definePluginApp((app) => {
